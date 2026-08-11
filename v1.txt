@@ -1,0 +1,460 @@
+# Task: Analyze Existing RTL and Create Memory Arbiter Design Plan
+
+## Objective
+
+The firmware is a Data Delay Module using SRAM for data storage and replay.
+
+The existing design was originally developed for a single channel. The design is now being expanded to two channels, requiring a new Memory Arbiter / Memory Manager because the SRAM interface can only service one memory access transaction at a time.
+
+For this phase, DO NOT modify any RTL files and DO NOT implement the arbiter yet.
+
+First inspect the existing VHDL design and create a complete Markdown design document that will serve as the baseline for later requirements generation, RTL implementation, test-case development, and simulation.
+
+Create:
+
+`MEMORY_ARBITER_DESIGN.md`
+
+---
+
+# Existing System Architecture
+
+There are two data channels.
+
+## Channel 1 — One-Time Buffer
+
+Channel 1 is a one-time record/replay channel.
+
+The user configures the amount of data that Channel 1 must record and replay.
+
+Channel 1 performs its required recording and replay operation and eventually reaches a COMPLETE state.
+
+Only after the complete Channel 1 operation has finished, including both its required memory write and replay/read activity, the entire channel becomes inactive.
+
+Once Channel 1 reaches COMPLETE:
+
+* Channel 1 performs no additional SRAM reads.
+* Channel 1 performs no additional SRAM writes.
+* Channel 1 no longer participates in memory arbitration.
+* Channel 1 remains inactive until the system is reset/restarted.
+
+The existing Channel 1 control logic should provide one channel-level active/inactive indication to the Memory Arbiter.
+
+Do NOT create separate read-active and write-active controls for Channel 1 unless the existing architecture absolutely requires them.
+
+Conceptually:
+
+`ch1_active = 1`
+→ Channel 1 may participate in memory arbitration.
+
+`ch1_active = 0`
+→ Both Channel 1 Read and Channel 1 Write are excluded from arbitration.
+
+---
+
+## Channel 2 — Circular Buffer
+
+Channel 2 operates continuously as a circular buffer.
+
+Channel 2 continuously records and replays data during normal system operation.
+
+Therefore Channel 2 normally remains active continuously.
+
+Its Read and Write requesters continue participating in memory arbitration after Channel 1 has completed.
+
+---
+
+# SRAM Access
+
+The system contains a single SRAM interface.
+
+Only one requester may control/access the SRAM interface at a time.
+
+There are four SRAM requesters:
+
+1. Channel 1 Read
+2. Channel 1 Write
+3. Channel 2 Read
+4. Channel 2 Write
+
+The new Memory Arbiter shall determine which requester is allowed to access the SRAM interface.
+
+---
+
+# Default Arbitration Algorithm
+
+For the initial implementation, use only a simple rotating Round-Robin arbitration algorithm.
+
+Do NOT implement any of the following in this initial version:
+
+* Read priority
+* Write priority
+* FIFO occupancy priority
+* FIFO almost-full priority
+* Dynamic priority
+* Weighted arbitration
+* QoS
+* Bandwidth weighting
+* Emergency priority
+
+Those features may be evaluated later.
+
+The default arbitration order shall conceptually be:
+
+`CH1_READ -> CH1_WRITE -> CH2_READ -> CH2_WRITE -> repeat`
+
+The implementation must use rotating priority.
+
+After a requester completes its SRAM transaction, the next arbitration search shall begin with the requester immediately following the requester that was just serviced.
+
+Example:
+
+If Channel 1 Read was just serviced, the next search order shall be:
+
+`CH1_WRITE -> CH2_READ -> CH2_WRITE -> CH1_READ`
+
+Even if Channel 1 Read continues asserting its request, another pending requester appearing later in the rotation shall receive its turn before Channel 1 Read is serviced again.
+
+The arbitration algorithm shall therefore prevent one continuously asserted requester from monopolizing SRAM access.
+
+However, the arbiter shall NOT intentionally create an idle SRAM cycle only for fairness.
+
+If only one eligible requester is requesting SRAM, it may be serviced repeatedly.
+
+Requesters that are not requesting memory shall be skipped.
+
+Requesters belonging to an inactive channel shall also be skipped.
+
+---
+
+# Channel 1 Completion Behavior
+
+When Channel 1 reaches its terminal COMPLETE condition, its channel-level active indication shall become inactive.
+
+The arbiter shall then automatically exclude:
+
+`CH1_READ`
+and
+`CH1_WRITE`
+
+from all subsequent arbitration.
+
+The arbiter should NOT require a separate "Channel-2-only" arbitration mode.
+
+The existing Round-Robin algorithm should naturally reduce from four eligible requesters to the remaining Channel 2 requesters.
+
+Conceptually:
+
+Before Channel 1 completion:
+
+`CH1_READ -> CH1_WRITE -> CH2_READ -> CH2_WRITE`
+
+After Channel 1 completion:
+
+`CH2_READ -> CH2_WRITE -> repeat`
+
+subject to which request signals are actually asserted.
+
+---
+
+# RTL Implementation Standards
+
+The project uses VHDL.
+
+Do NOT use SystemVerilog.
+
+Follow the coding style already used by the existing firmware wherever practical.
+
+The new RTL should favor synchronous, clocked, registered logic.
+
+Prefer registered control and timing behavior over large asynchronous/combinational control structures.
+
+Use signals for state, control, arbitration information, counters, and datapath/control interfaces whenever practical.
+
+Avoid VHDL variables unless there is a strong technical reason that makes a variable preferable or necessary.
+
+If a variable is considered necessary, document why before using it.
+
+The RTL should be easy to inspect in waveform simulation.
+
+Important internal arbitration status such as current owner, previous serviced requester, or round-robin pointer should preferably exist as explicit signals/registers so they can be observed during simulation.
+
+Use clear enumerated states/types where appropriate and consistent with the project's existing VHDL coding conventions.
+
+Avoid unnecessary architectural changes to existing state machines.
+
+Modify existing RTL only where required to integrate the Memory Arbiter.
+
+---
+
+# Existing RTL Analysis Required
+
+Before proposing the new arbiter interface, inspect the existing project RTL.
+
+Identify the existing blocks responsible for:
+
+* Channel 1 Read state machine/controller
+* Channel 1 Write state machine/controller
+* Channel 2 Read state machine/controller
+* Channel 2 Write state machine/controller
+* SRAM interface/controller
+* Top-level logic connecting these blocks
+* Existing SRAM address signals
+* Existing SRAM write-data signals
+* Existing SRAM read-data signals
+* Existing SRAM read/write controls
+* Existing request/enable/busy/done/valid handshaking signals
+* Existing state-machine completion behavior
+* Existing Channel 1 COMPLETE behavior
+
+Do not assume signal names.
+
+Use the actual RTL implementation to determine the current interfaces.
+
+---
+
+# Integration Analysis
+
+Determine exactly what signals must be added or modified between each existing requester and the new Memory Arbiter.
+
+For each of the four requesters, determine whether the arbiter requires signals equivalent to:
+
+* memory request
+* operation type if necessary
+* SRAM address
+* write data
+* grant/accept
+* transaction complete
+* read-data valid
+* read data
+
+Do not blindly add these signals if equivalent signals already exist.
+
+Reuse existing interfaces whenever practical.
+
+Document which existing signals can be reused and which new signals are required.
+
+---
+
+# State Machine Impact Analysis
+
+Inspect each existing Channel 1 and Channel 2 Read/Write state machine.
+
+For every state machine, identify:
+
+* where an SRAM transaction is currently initiated;
+* where SRAM address/data is currently driven;
+* how the state machine currently determines that the transaction was accepted;
+* how it waits for SRAM completion;
+* how read data is returned;
+* which states will require modification after introduction of the Memory Arbiter;
+* which new request/grant/complete signals are required;
+* whether address/data must remain stable while waiting for arbitration;
+* whether any existing timing assumptions will become invalid when SRAM access can be delayed by arbitration.
+
+Pay particular attention to state machines that currently assume immediate SRAM ownership because the previous single-channel design did not require arbitration.
+
+Document these required modifications in `MEMORY_ARBITER_DESIGN.md`.
+
+Do NOT modify the state machines during this phase.
+
+---
+
+# SRAM Interface Impact Analysis
+
+Inspect the existing SRAM interface block.
+
+Determine:
+
+* how read transactions are initiated;
+* how write transactions are initiated;
+* SRAM read latency;
+* SRAM write timing;
+* whether the interface has a busy/ready/done mechanism;
+* whether read data has a valid indication;
+* whether multiple transactions can be outstanding;
+* whether the interface expects address/data/control signals to remain stable for multiple clock cycles;
+* which signals are currently driven directly by the channel state machines;
+* which signals must instead be driven by the new Memory Arbiter.
+
+The Memory Arbiter will ultimately become the single logical owner of the SRAM interface.
+
+Document the exact required interface changes.
+
+Do NOT modify the SRAM interface during this phase.
+
+---
+
+# Arbitration Transaction Boundary
+
+Determine from the actual SRAM implementation what constitutes a completed transaction.
+
+The Round-Robin pointer must advance based on completion of the appropriate SRAM transaction, not simply because a request was observed.
+
+Define exactly when ownership is acquired and released.
+
+The design must ensure that ownership does not change in the middle of a memory transaction.
+
+---
+
+# Requirements Planning
+
+The Markdown design document shall also propose the firmware requirements that will later be formally created.
+
+Requirements must eventually cover at least:
+
+* four-requester SRAM arbitration;
+* single SRAM ownership;
+* Round-Robin requester ordering;
+* rotating starting priority;
+* fairness;
+* skipping inactive requesters;
+* skipping non-requesting requesters;
+* no unnecessary idle arbitration slots;
+* Channel 1 removal after COMPLETE;
+* continued Channel 2 operation;
+* request/grant behavior;
+* transaction ownership;
+* transaction completion;
+* SRAM read behavior;
+* SRAM write behavior;
+* reset behavior;
+* deterministic initialization of the Round-Robin pointer;
+* stable requester control/address/data while awaiting service where required;
+* prevention of simultaneous SRAM ownership;
+* integration with existing Channel state machines;
+* integration with the SRAM interface.
+
+Do not yet assign final requirement IDs unless the project already has an established requirement-ID convention.
+
+If an existing requirement format or numbering scheme exists in the repository, identify it and recommend using that convention.
+
+---
+
+# Verification Planning
+
+Every firmware requirement will later require one or more corresponding verification test cases.
+
+The design document shall propose a requirement-to-test strategy.
+
+The future tests must cover, at minimum:
+
+* each individual requester operating alone;
+* all four requesters requesting simultaneously;
+* two-requester combinations;
+* continuously asserted requesters;
+* requester appearing while another transaction is active;
+* requester disappearing before being granted, if allowed by the existing protocol;
+* Round-Robin wraparound;
+* correct advancement after each completed transaction;
+* no starvation under continuous request conditions;
+* no unnecessary idle cycles when at least one eligible request exists;
+* Channel 1 transitioning to COMPLETE;
+* Channel 1 requests ignored after Channel 1 becomes inactive;
+* Channel 2 continuing after Channel 1 completion;
+* SRAM read transactions;
+* SRAM write transactions;
+* reset during idle conditions;
+* reset behavior of arbitration state;
+* any SRAM-interface-specific timing cases discovered during RTL inspection.
+
+The final verification environment will use simulation to demonstrate compliance with the firmware requirements.
+
+---
+
+# Required Content of MEMORY_ARBITER_DESIGN.md
+
+The Markdown document shall contain:
+
+## 1. Purpose and Scope
+
+## 2. Existing Architecture Summary
+
+## 3. Channel 1 Behavior
+
+## 4. Channel 2 Behavior
+
+## 5. Current SRAM Interface Architecture
+
+## 6. Identified Existing RTL Blocks and Source Files
+
+For each relevant block, include the actual RTL filename/entity and its role.
+
+## 7. Existing SRAM Signal Flow
+
+Describe the existing path from the channel state machines to SRAM.
+
+## 8. Proposed Memory Arbiter Architecture
+
+## 9. Proposed Arbiter Input/Output Interface
+
+Use actual project signal naming where practical.
+
+Clearly distinguish existing signals from proposed new signals.
+
+## 10. Default Round-Robin Algorithm
+
+Include examples of arbitration sequences.
+
+## 11. Channel 1 COMPLETE / Channel Disable Behavior
+
+## 12. Transaction Ownership and Completion Definition
+
+## 13. Required Channel 1 RTL Changes
+
+Identify exact state machines, states, and signal/interface changes.
+
+## 14. Required Channel 2 RTL Changes
+
+Identify exact state machines, states, and signal/interface changes.
+
+## 15. Required SRAM Interface Changes
+
+## 16. Required Top-Level Integration Changes
+
+## 17. VHDL Implementation Strategy
+
+Describe recommended FSM/register structure without writing the final implementation.
+
+## 18. Firmware Requirement Coverage Plan
+
+## 19. Verification and Test-Case Coverage Plan
+
+## 20. Open Issues / Assumptions
+
+Any uncertainty discovered in the existing RTL must be explicitly documented.
+
+Do not silently guess.
+
+---
+
+# Important Constraints
+
+This phase is analysis and architecture only.
+
+DO NOT:
+
+* implement the Memory Arbiter;
+* modify existing VHDL;
+* create production RTL;
+* change state machines;
+* change the SRAM interface;
+* start simulation;
+* implement priority modes;
+* implement FIFO-aware arbitration.
+
+The only implementation artifact for this phase shall be:
+
+`MEMORY_ARBITER_DESIGN.md`
+
+Inspect the actual project thoroughly before creating the document.
+
+Where the existing RTL differs from assumptions in this task description, document the difference explicitly and base the proposed integration on the real RTL.
+
+At the end, provide a concise summary of:
+
+1. files inspected;
+2. major architectural findings;
+3. RTL blocks that will require modification;
+4. new signals/interfaces expected;
+5. unresolved design questions;
+6. whether the project is ready to proceed to formal firmware requirements generation.

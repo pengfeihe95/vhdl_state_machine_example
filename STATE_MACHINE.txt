@@ -1,0 +1,446 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity memory_manager is
+    generic (
+        ADDR_WIDTH : positive := 32;
+        DATA_WIDTH : positive := 32
+    );
+    port (
+        ----------------------------------------------------------------
+        -- Clock / Reset
+        ----------------------------------------------------------------
+        clk_i : in std_logic;
+        rst_i : in std_logic;
+
+        ----------------------------------------------------------------
+        -- Channel 1
+        -- '0' = Channel 1 COMPLETE, both Read and Write disabled
+        ----------------------------------------------------------------
+        ch1_active_i : in std_logic;
+
+        ----------------------------------------------------------------
+        -- Channel 1 Read
+        ----------------------------------------------------------------
+        ch1_rd_req_i   : in  std_logic;
+        ch1_rd_addr_i  : in  std_logic_vector(ADDR_WIDTH-1 downto 0);
+        ch1_rd_grant_o : out std_logic;
+        ch1_rd_done_o  : out std_logic;
+        ch1_rd_data_o  : out std_logic_vector(DATA_WIDTH-1 downto 0);
+
+        ----------------------------------------------------------------
+        -- Channel 1 Write
+        ----------------------------------------------------------------
+        ch1_wr_req_i   : in  std_logic;
+        ch1_wr_addr_i  : in  std_logic_vector(ADDR_WIDTH-1 downto 0);
+        ch1_wr_data_i  : in  std_logic_vector(DATA_WIDTH-1 downto 0);
+        ch1_wr_grant_o : out std_logic;
+        ch1_wr_done_o  : out std_logic;
+
+        ----------------------------------------------------------------
+        -- Channel 2 Read
+        ----------------------------------------------------------------
+        ch2_rd_req_i   : in  std_logic;
+        ch2_rd_addr_i  : in  std_logic_vector(ADDR_WIDTH-1 downto 0);
+        ch2_rd_grant_o : out std_logic;
+        ch2_rd_done_o  : out std_logic;
+        ch2_rd_data_o  : out std_logic_vector(DATA_WIDTH-1 downto 0);
+
+        ----------------------------------------------------------------
+        -- Channel 2 Write
+        ----------------------------------------------------------------
+        ch2_wr_req_i   : in  std_logic;
+        ch2_wr_addr_i  : in  std_logic_vector(ADDR_WIDTH-1 downto 0);
+        ch2_wr_data_i  : in  std_logic_vector(DATA_WIDTH-1 downto 0);
+        ch2_wr_grant_o : out std_logic;
+        ch2_wr_done_o  : out std_logic;
+
+        ----------------------------------------------------------------
+        -- SRAM Interface
+        ----------------------------------------------------------------
+        sram_start_o : out std_logic;
+        sram_write_o : out std_logic;
+        sram_addr_o  : out std_logic_vector(ADDR_WIDTH-1 downto 0);
+        sram_wdata_o : out std_logic_vector(DATA_WIDTH-1 downto 0);
+
+        sram_done_i  : in  std_logic;
+        sram_rdata_i : in  std_logic_vector(DATA_WIDTH-1 downto 0)
+    );
+end entity;
+
+
+architecture rtl of memory_manager is
+
+    --------------------------------------------------------------------
+    -- Requester Index
+    --
+    -- 0 = CH1 Read
+    -- 1 = CH1 Write
+    -- 2 = CH2 Read
+    -- 3 = CH2 Write
+    --------------------------------------------------------------------
+    constant CH1_RD : integer := 0;
+    constant CH1_WR : integer := 1;
+    constant CH2_RD : integer := 2;
+    constant CH2_WR : integer := 3;
+
+
+    --------------------------------------------------------------------
+    -- State Machine
+    --------------------------------------------------------------------
+    type state_t is (
+        IDLE,
+        SELECT_REQ,
+        COMPLETE
+    );
+
+    signal state_r : state_t := IDLE;
+
+
+    --------------------------------------------------------------------
+    -- Request / Arbitration Signals
+    --------------------------------------------------------------------
+    signal req_s : std_logic_vector(3 downto 0);
+
+    signal rr_pointer_r    : integer range 0 to 3 := CH1_RD;
+    signal current_owner_r : integer range 0 to 3 := CH1_RD;
+
+
+    --------------------------------------------------------------------
+    -- Registered SRAM Interface
+    --------------------------------------------------------------------
+    signal sram_start_r : std_logic := '0';
+    signal sram_write_r : std_logic := '0';
+
+    signal sram_addr_r :
+        std_logic_vector(ADDR_WIDTH-1 downto 0) := (others => '0');
+
+    signal sram_wdata_r :
+        std_logic_vector(DATA_WIDTH-1 downto 0) := (others => '0');
+
+
+    --------------------------------------------------------------------
+    -- Find Next Request
+    --
+    -- Fixed loop bounds make this synthesizable.
+    --
+    -- The loop is implemented as combinational selection logic.
+    -- It does NOT require four clock cycles.
+    --
+    -- This function shall only be called when req /= "0000".
+    --------------------------------------------------------------------
+    function find_next_request (
+        req       : std_logic_vector(3 downto 0);
+        start_idx : integer
+    ) return integer is
+
+        variable idx_v : integer range 0 to 3;
+
+    begin
+
+        for offset in 0 to 3 loop
+
+            idx_v := (start_idx + offset) mod 4;
+
+            if req(idx_v) = '1' then
+                return idx_v;
+            end if;
+
+        end loop;
+
+        -- No-request case is prevented by caller.
+        -- Required return for complete function definition.
+        return start_idx;
+
+    end function;
+
+
+begin
+
+    --------------------------------------------------------------------
+    -- SRAM Outputs
+    --------------------------------------------------------------------
+    sram_start_o <= sram_start_r;
+    sram_write_o <= sram_write_r;
+    sram_addr_o  <= sram_addr_r;
+    sram_wdata_o <= sram_wdata_r;
+
+
+    --------------------------------------------------------------------
+    -- Effective Request Vector
+    --
+    -- When Channel 1 becomes inactive, BOTH Channel 1 requests
+    -- are automatically removed from arbitration.
+    --------------------------------------------------------------------
+    req_s(CH1_RD) <= ch1_rd_req_i and ch1_active_i;
+    req_s(CH1_WR) <= ch1_wr_req_i and ch1_active_i;
+
+    req_s(CH2_RD) <= ch2_rd_req_i;
+    req_s(CH2_WR) <= ch2_wr_req_i;
+
+
+    --------------------------------------------------------------------
+    -- Main Arbiter State Machine
+    --------------------------------------------------------------------
+    process(clk_i)
+
+        variable selected_v : integer range 0 to 3;
+
+    begin
+
+        if rising_edge(clk_i) then
+
+            if rst_i = '1' then
+
+                --------------------------------------------------------
+                -- State / Arbitration
+                --------------------------------------------------------
+                state_r         <= IDLE;
+                rr_pointer_r    <= CH1_RD;
+                current_owner_r <= CH1_RD;
+
+                --------------------------------------------------------
+                -- SRAM
+                --------------------------------------------------------
+                sram_start_r <= '0';
+                sram_write_r <= '0';
+                sram_addr_r  <= (others => '0');
+                sram_wdata_r <= (others => '0');
+
+                --------------------------------------------------------
+                -- Grants
+                --------------------------------------------------------
+                ch1_rd_grant_o <= '0';
+                ch1_wr_grant_o <= '0';
+                ch2_rd_grant_o <= '0';
+                ch2_wr_grant_o <= '0';
+
+                --------------------------------------------------------
+                -- Completion
+                --------------------------------------------------------
+                ch1_rd_done_o <= '0';
+                ch1_wr_done_o <= '0';
+                ch2_rd_done_o <= '0';
+                ch2_wr_done_o <= '0';
+
+                --------------------------------------------------------
+                -- Read Data
+                --------------------------------------------------------
+                ch1_rd_data_o <= (others => '0');
+                ch2_rd_data_o <= (others => '0');
+
+
+            else
+
+                --------------------------------------------------------
+                -- One-clock pulse defaults
+                --------------------------------------------------------
+                sram_start_r <= '0';
+
+                ch1_rd_grant_o <= '0';
+                ch1_wr_grant_o <= '0';
+                ch2_rd_grant_o <= '0';
+                ch2_wr_grant_o <= '0';
+
+                ch1_rd_done_o <= '0';
+                ch1_wr_done_o <= '0';
+                ch2_rd_done_o <= '0';
+                ch2_wr_done_o <= '0';
+
+
+                --------------------------------------------------------
+                -- Arbiter FSM
+                --------------------------------------------------------
+                case state_r is
+
+
+                    ----------------------------------------------------
+                    -- IDLE
+                    --
+                    -- Wait until at least one requester is active.
+                    ----------------------------------------------------
+                    when IDLE =>
+
+                        if req_s /= "0000" then
+                            state_r <= SELECT_REQ;
+                        end if;
+
+
+                    ----------------------------------------------------
+                    -- SELECT_REQ
+                    --
+                    -- Select one requester using rotating Round-Robin.
+                    ----------------------------------------------------
+                    when SELECT_REQ =>
+
+                        if req_s /= "0000" then
+
+                            selected_v :=
+                                find_next_request(
+                                    req_s,
+                                    rr_pointer_r
+                                );
+
+                            ------------------------------------------------
+                            -- Lock owner for full SRAM transaction
+                            ------------------------------------------------
+                            current_owner_r <= selected_v;
+
+
+                            ------------------------------------------------
+                            -- Route selected requester to SRAM
+                            ------------------------------------------------
+                            case selected_v is
+
+
+                                --------------------------------------------
+                                -- Channel 1 Read
+                                --------------------------------------------
+                                when CH1_RD =>
+
+                                    sram_write_r <= '0';
+                                    sram_addr_r  <= ch1_rd_addr_i;
+
+                                    ch1_rd_grant_o <= '1';
+
+
+                                --------------------------------------------
+                                -- Channel 1 Write
+                                --------------------------------------------
+                                when CH1_WR =>
+
+                                    sram_write_r <= '1';
+                                    sram_addr_r  <= ch1_wr_addr_i;
+                                    sram_wdata_r <= ch1_wr_data_i;
+
+                                    ch1_wr_grant_o <= '1';
+
+
+                                --------------------------------------------
+                                -- Channel 2 Read
+                                --------------------------------------------
+                                when CH2_RD =>
+
+                                    sram_write_r <= '0';
+                                    sram_addr_r  <= ch2_rd_addr_i;
+
+                                    ch2_rd_grant_o <= '1';
+
+
+                                --------------------------------------------
+                                -- Channel 2 Write
+                                --------------------------------------------
+                                when CH2_WR =>
+
+                                    sram_write_r <= '1';
+                                    sram_addr_r  <= ch2_wr_addr_i;
+                                    sram_wdata_r <= ch2_wr_data_i;
+
+                                    ch2_wr_grant_o <= '1';
+
+
+                                when others =>
+                                    null;
+
+                            end case;
+
+
+                            ------------------------------------------------
+                            -- Start SRAM transaction
+                            ------------------------------------------------
+                            sram_start_r <= '1';
+
+                            state_r <= COMPLETE;
+
+
+                        else
+
+                            -- Request disappeared before selection
+                            state_r <= IDLE;
+
+                        end if;
+
+
+                    ----------------------------------------------------
+                    -- COMPLETE
+                    --
+                    -- Hold transaction ownership until SRAM is finished.
+                    ----------------------------------------------------
+                    when COMPLETE =>
+
+                        if sram_done_i = '1' then
+
+
+                            ------------------------------------------------
+                            -- Return completion to correct requester
+                            ------------------------------------------------
+                            case current_owner_r is
+
+
+                                when CH1_RD =>
+
+                                    ch1_rd_done_o <= '1';
+                                    ch1_rd_data_o <= sram_rdata_i;
+
+
+                                when CH1_WR =>
+
+                                    ch1_wr_done_o <= '1';
+
+
+                                when CH2_RD =>
+
+                                    ch2_rd_done_o <= '1';
+                                    ch2_rd_data_o <= sram_rdata_i;
+
+
+                                when CH2_WR =>
+
+                                    ch2_wr_done_o <= '1';
+
+
+                                when others =>
+                                    null;
+
+                            end case;
+
+
+                            ------------------------------------------------
+                            -- Rotate Round-Robin starting position
+                            --
+                            -- 0 -> 1
+                            -- 1 -> 2
+                            -- 2 -> 3
+                            -- 3 -> 0
+                            ------------------------------------------------
+                            rr_pointer_r <=
+                                (current_owner_r + 1) mod 4;
+
+
+                            ------------------------------------------------
+                            -- Continue directly to another selection if
+                            -- another request is pending.
+                            ------------------------------------------------
+                            if req_s /= "0000" then
+                                state_r <= SELECT_REQ;
+                            else
+                                state_r <= IDLE;
+                            end if;
+
+                        end if;
+
+
+                    when others =>
+
+                        state_r <= IDLE;
+
+                end case;
+
+            end if;
+
+        end if;
+
+    end process;
+
+end architecture rtl;
